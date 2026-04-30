@@ -23,13 +23,14 @@ logger = logging.getLogger(__name__)
 
 class HidenCloud:
     def __init__(self, cookie_str, tg_config=None):
-        self.base_url = "https://hidencloud.com"
+        self.base_url = "https://dash.hidencloud.com"
         self.cookie_str = cookie_str
         self.tg_config = tg_config
         self.session = requests.Session(impersonate="chrome110")
         self.username = "Unknown"
         self.balance = "未知"
         self.updated_cookies = False
+        self.csrf_token = ""
         self.parse_and_set_cookies()
 
     def parse_and_set_cookies(self):
@@ -38,15 +39,22 @@ class HidenCloud:
             return
         
         cookies = {}
+        # 改进解析，处理可能存在的引号或复杂值
         for item in self.cookie_str.split(';'):
             if '=' in item:
-                key, value = item.strip().split('=', 1)
-                cookies[key] = value
+                parts = item.strip().split('=', 1)
+                if len(parts) == 2:
+                    key, value = parts
+                    cookies[key] = value
         self.session.cookies.update(cookies)
 
     def get_cookie_string(self):
-        """获取当前的 Cookie 字符串"""
-        return "; ".join([f"{k}={v}" for k, v in self.session.cookies.get_dict().items()])
+        """获取当前的 Cookie 字符串 (确保捕获所有域名的 Cookie)"""
+        cookie_list = []
+        # items() 返回的是 (name, value) 元组
+        for name, value in self.session.cookies.items():
+            cookie_list.append(f"{name}={value}")
+        return "; ".join(cookie_list)
 
     def update_github_secret(self, new_cookie):
         """自动更新 GitHub Secret"""
@@ -154,43 +162,71 @@ class HidenCloud:
         except Exception as e:
             logger.error(f"发送 Telegram 通知出错: {e}")
 
-    def get_csrf_token(self, url):
-        """从页面中提取 CSRF Token"""
+    def get_csrf_token(self, url=None, html=None):
+        """从页面或 HTML 中提取 CSRF Token"""
         try:
-            resp = self.session.get(url, timeout=20)
-            soup = BeautifulSoup(resp.text, 'html.parser')
+            if html is None and url:
+                resp = self.session.get(url, timeout=20)
+                html = resp.text
+            
+            if not html:
+                return None
+                
+            soup = BeautifulSoup(html, 'html.parser')
             token_meta = soup.find('meta', attrs={'name': 'csrf-token'})
             if token_meta:
-                return token_meta.get('content')
+                self.csrf_token = token_meta.get('content')
+                return self.csrf_token
             
             token_input = soup.find('input', attrs={'name': '_token'})
             if token_input:
-                return token_input.get('value')
+                self.csrf_token = token_input.get('value')
+                return self.csrf_token
         except Exception as e:
             logger.error(f"获取 CSRF Token 失败: {e}")
-        return None
+        return self.csrf_token
 
     def check_login(self):
         """检查登录状态并获取用户名"""
         try:
-            resp = self.session.get(f"{self.base_url}/dashboard", timeout=20, allow_redirects=False)
+            resp = self.session.get(f"{self.base_url}/dashboard", timeout=20, allow_redirects=True)
+            if "/login" in resp.url:
+                return False
+                
             if resp.status_code == 200:
                 soup = BeautifulSoup(resp.text, 'html.parser')
-                # 提取用户名
-                email_tag = soup.find('span', string=re.compile(r'.+@.+\..+'))
-                if email_tag:
+                # 刷新 CSRF
+                self.get_csrf_token(html=resp.text)
+                
+                # 提取用户名 - 优先找 Email
+                email_tag = soup.select_one('p.font-light.text-gray-500')
+                if not email_tag:
+                    email_tag = soup.find('p', string=re.compile(r'.+@.+\..+'))
+                
+                if email_tag and "[email" not in email_tag.get_text():
                     self.username = email_tag.get_text().strip()
-                
-                # 提取余额
-                balance_tag = soup.find('h4', string=re.compile(r'¥|余额'))
-                if balance_tag:
-                    self.balance = balance_tag.get_text().strip()
                 else:
-                    # 尝试寻找包含金额的元素
-                    amount_tag = soup.find(string=re.compile(r'¥\s*\d+\.\d+'))
-                    if amount_tag:
-                        self.balance = amount_tag.strip()
+                    # 备选：查找用户名链接 (通常是真实姓名)
+                    name_tag = soup.select_one('h3 > a[href="#"]')
+                    if name_tag:
+                        self.username = name_tag.get_text().strip()
+                    elif email_tag:
+                        self.username = email_tag.get_text().strip()
+
+                # 提取余额 - 查找包含金额的卡片
+                balance_link = soup.select_one('a[href*="/balance"]')
+                if balance_link:
+                    balance_tag = balance_link.find(['dt', 'h4', 'div'], class_=re.compile(r'font-extrabold|text-3xl'))
+                    if balance_tag:
+                        self.balance = balance_tag.get_text().strip()
                 
+                if self.balance == "未知":
+                    # 兜底：正则搜索货币符号
+                    balance_text = soup.find(string=re.compile(r'(¥|€|余额)\s*\d+\.\d+'))
+                    if balance_text:
+                        self.balance = balance_text.strip()
+                
+                logger.info(f"✅ 账号 {self.username} 登录成功 (余额: {self.balance})")
                 return True
         except Exception as e:
             logger.error(f"登录状态检查异常: {e}")
@@ -211,7 +247,10 @@ class HidenCloud:
         """对指定服务进行续期"""
         logger.info(f"正在为服务 {service_id} 申请续期...")
         manage_url = f"{self.base_url}/service/{service_id}/manage"
-        token = self.get_csrf_token(manage_url)
+        
+        # 获取管理页面并提取 Token
+        resp = self.session.get(manage_url, timeout=20)
+        token = self.get_csrf_token(html=resp.text)
         if not token:
             return False, "获取续期 Token 失败"
 
@@ -220,40 +259,132 @@ class HidenCloud:
             "_token": token,
             "days": "7"
         }
-        headers = {"referer": manage_url}
+        # 添加 XSRF Token 支持
+        xsrf_token = self.session.cookies.get("XSRF-TOKEN")
+        headers = {
+            "Referer": manage_url,
+            "Origin": self.base_url,
+            "X-CSRF-TOKEN": token
+        }
+        if xsrf_token:
+            from urllib.parse import unquote
+            headers["X-XSRF-TOKEN"] = unquote(xsrf_token)
 
         try:
             resp = self.session.post(renew_url, data=data, headers=headers, timeout=20)
-            if resp.status_code == 200 or "payment" in resp.url or "invoice" in resp.url:
+            # 如果跳转到了账单页，或者响应中包含成功信息，说明续期申请成功
+            if "invoice" in resp.url or "payment" in resp.url:
                 return True, "申请成功"
-            else:
-                return False, f"续期请求失败: {resp.status_code}"
+            
+            # 检查页面是否包含错误信息
+            soup_res = BeautifulSoup(resp.text, 'html.parser')
+            alert = soup_res.find(['div', 'span'], attrs={'role': 'alert'})
+            if alert:
+                alert_text = alert.get_text(strip=True)
+                if "only renew" in alert_text or "expires in" in alert_text:
+                    # 提取剩余天数
+                    days_match = re.search(r'expires in (\d+) days', alert_text)
+                    days_info = f" (剩余 {days_match.group(1)} 天)" if days_match else ""
+                    return True, f"未到期{days_info}"
+                return False, f"申请失败: {alert_text}"
+            
+            if resp.status_code == 200 and "dash.hidencloud.com/service" in resp.url:
+                # 仍在管理页但没报错，可能是已经申请过或者其他情况
+                return True, "状态正常"
+                
+            return False, f"续期请求失败: {resp.status_code}"
         except Exception as e:
             return False, f"续期异常: {e}"
 
     def pay_unpaid_invoices(self, service_id):
         """检测并支付未支付订单"""
-        logger.info(f"正在检查服务 {service_id} 的未支付订单...")
-        invoice_url = f"{self.base_url}/service/{service_id}/invoices?where=unpaid"
+        logger.info(f"正在检查服务 {service_id} 的待支付订单...")
+        invoice_list_url = f"{self.base_url}/service/{service_id}/invoices?where=unpaid"
         try:
-            resp = self.session.get(invoice_url, timeout=20)
-            payment_ids = re.findall(r'payment/(\d+)', resp.text)
-            if not payment_ids:
+            resp = self.session.get(invoice_list_url, timeout=20)
+            # 查找所有账单链接 (使用 BeautifulSoup 过滤通知栏链接)
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            invoice_links = []
+            
+            # 查找所有的 a 标签
+            for a in soup.find_all('a', href=True):
+                href = a['href']
+                if '/invoice/' in href and 'download' not in href:
+                    # 检查父容器是否包含 "Unpaid" 或 "待支付"
+                    parent = a.find_parent(['tr', 'div', 'li'])
+                    if parent:
+                        parent_text = parent.get_text()
+                        if any(kw in parent_text for kw in ['Unpaid', '待支付', '未支付', '待付款']):
+                            invoice_links.append(href)
+            
+            if not invoice_links:
                 return True, "无待支付订单"
 
             success_count = 0
-            for p_id in payment_ids:
-                p_url = f"{self.base_url}/payment/{p_id}"
-                token = self.get_csrf_token(p_url)
-                if not token: continue
+            invoice_links = list(set(invoice_links)) # 去重
+            
+            for inv_link in invoice_links:
+                if not inv_link.startswith('http'):
+                    inv_link = self.base_url + inv_link
                 
-                pay_resp = self.session.post(p_url, data={"_token": token}, timeout=20)
-                if "成功" in pay_resp.text or pay_resp.status_code == 200:
-                    success_count += 1
-                else:
-                    logger.warning(f"订单 {p_id} 支付失败，可能是余额不足")
+                logger.info(f"  └ 正在处理账单页面: {inv_link.split('/')[-1]}")
+                inv_resp = self.session.get(inv_link, timeout=20)
+                inv_soup = BeautifulSoup(inv_resp.text, 'html.parser')
+                
+                # 寻找支付表单
+                pay_form = None
+                for form in inv_soup.find_all('form'):
+                    action = form.get('action', '')
+                    # 排除充值表单
+                    if 'balance/add' in action: continue
+                    
+                    # 查找提交按钮
+                    btn = form.find(['button', 'input'], attrs={'type': 'submit'})
+                    if not btn: btn = form.find('button')
+                    
+                    if btn and ('支付' in btn.get_text() or 'Pay' in btn.get_text() or '确认' in btn.get_text()):
+                        pay_form = form
+                        break
+                
+                if not pay_form:
+                    # 降级尝试：寻找任何包含 invoice 或 payment 的表单
+                    for form in inv_soup.find_all('form'):
+                        action = form.get('action', '')
+                        if 'invoice' in action or 'payment' in action:
+                            pay_form = form
+                            break
 
-            return True, f"支付完成 ({success_count}/{len(payment_ids)} 成功)"
+                if pay_form:
+                    action = pay_form.get('action', '')
+                    if not action.startswith('http'):
+                        action = self.base_url + action
+                        
+                    # 提取表单数据
+                    payload = {}
+                    for inp in pay_form.find_all('input'):
+                        name = inp.get('name')
+                        if name:
+                            payload[name] = inp.get('value', '')
+                    
+                    # 补充 Token
+                    token = self.get_csrf_token(html=inv_resp.text)
+                    if token: payload['_token'] = token
+                    
+                    headers = {
+                        "Referer": inv_link,
+                        "X-CSRF-TOKEN": token or self.csrf_token
+                    }
+                    
+                    pay_resp = self.session.post(action, data=payload, headers=headers, timeout=20)
+                    if "成功" in pay_resp.text or "Success" in pay_resp.text or pay_resp.status_code == 200:
+                        success_count += 1
+                        logger.info("    ✅ 支付成功")
+                    else:
+                        logger.warning(f"    ❌ 支付失败 (状态码: {pay_resp.status_code})")
+                else:
+                    logger.warning("    ⚠️ 未能在账单页找到支付按钮，请检查页面结构")
+
+            return True, f"支付完成 ({success_count}/{len(invoice_links)} 成功)"
         except Exception as e:
             return False, f"支付异常: {e}"
 
@@ -295,8 +426,38 @@ class HidenCloud:
         # 检查并更新 Cookie
         new_cookie_str = self.get_cookie_string()
         if new_cookie_str != self.cookie_str:
-            logger.info("检测到 Cookie 已刷新，准备同步到 GitHub Secrets")
+            logger.info("检测到 Cookie 已刷新，准备同步到本地及 GitHub Secrets")
+            
+            # 1. 更新 GitHub Secrets
             self.update_github_secret(new_cookie_str)
+            
+            # 2. 更新本地 config.json (如果运行在本地)
+            self.update_local_config(new_cookie_str)
+
+    def update_local_config(self, new_cookie):
+        """同步更新本地 config.json"""
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        config_path = os.path.join(current_dir, "config.json")
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r') as f:
+                    config_data = json.load(f)
+                
+                # 寻找并更新匹配的账号
+                updated = False
+                for acc in config_data.get("accounts", []):
+                    # 通过 cookie_str 的部分内容或用户名匹配 (简单处理：如果只有一个账号就直接更)
+                    if acc.get("cookie_str") == self.cookie_str or len(config_data.get("accounts", [])) == 1:
+                        acc["cookie_str"] = new_cookie
+                        updated = True
+                        break
+                
+                if updated:
+                    with open(config_path, 'w') as f:
+                        json.dump(config_data, f, indent=4, ensure_ascii=False)
+                    logger.info("✅ 本地 config.json 已同步更新")
+            except Exception as e:
+                logger.error(f"更新本地 config.json 失败: {e}")
 
 def main():
     config = {}
@@ -320,9 +481,14 @@ def main():
                 accounts = config.get("accounts", [])
                 account_cookies = []
                 for acc in accounts:
-                    if acc.get("cookies"):
-                        # 将字典格式的 cookie 转回字符串
-                        c_str = "; ".join([f"{k}={v}" for k, v in acc["cookies"].items()])
+                    if acc.get("cookie_str"):
+                        account_cookies.append(acc.get("cookie_str"))
+                    elif acc.get("cookies"):
+                        # 兼容字典格式
+                        if isinstance(acc["cookies"], dict):
+                            c_str = "; ".join([f"{k}={v}" for k, v in acc["cookies"].items()])
+                        else:
+                            c_str = str(acc["cookies"])
                         account_cookies.append(c_str)
         except Exception as e:
             logger.error(f"读取 config.json 失败: {e}")
