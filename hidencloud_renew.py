@@ -315,7 +315,7 @@ class HidenCloud:
                     parent = a.find_parent(['tr', 'div', 'li'])
                     if parent:
                         parent_text = parent.get_text()
-                        if any(kw in parent_text for kw in ['Unpaid', '待支付', '未支付', '待付款']):
+                        if any(kw in parent_text for kw in ['Unpaid', '待支付', '未支付', '待付款', "Invoice"]):
                             invoice_links.append(href)
             
             if not invoice_links:
